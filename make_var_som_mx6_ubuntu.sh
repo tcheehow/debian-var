@@ -30,6 +30,11 @@ readonly DEF_DEBIAN_MIRROR="http://httpredir.debian.org/debian"
 readonly DEB_RELEASE="stretch"
 readonly DEF_ROOTFS_TARBAR_NAME="rootfs.tar.gz"
 
+# default mirror
+readonly DEF_UBUNTU_MIRROR="http://ports.ubuntu.com/ubuntu-ports/"
+readonly UBUNTU_DISTRO="xenial"
+# readonly DEF_ROOTFS_TARBAR_NAME="rootfs.tar.gz"
+
 ## base paths
 readonly DEF_BUILDENV="${ABSOLUTE_DIRECTORY}"
 readonly DEF_SRC_DIR="${DEF_BUILDENV}/src"
@@ -132,6 +137,7 @@ readonly G_USER_PACKAGES=""
 
 #### Input params #####
 PARAM_DEB_LOCAL_MIRROR="${DEF_DEBIAN_MIRROR}"
+PARAM_UBUNTU_LOCAL_MIRROR="http://ports.ubuntu.com"
 PARAM_OUTPUT_DIR="${DEF_BUILDENV}/output"
 PARAM_DEBUG="0"
 PARAM_CMD="all"
@@ -302,6 +308,335 @@ function unpack_imx_package() {
 	/bin/sh ${1} --auto-accept
 	cd -
 	return $?
+}
+
+# function generate rootfs in input dir
+# $1 - rootfs base dir
+function make_ubuntu_rootfs() {
+	local ROOTFS_BASE=$1
+
+	pr_info "Make ubuntu(${UBUNTU_DISTRO}) rootfs start..."
+
+## umount previus mounts (if fail)
+	umount ${ROOTFS_BASE}/{sys,proc,dev/pts,dev} 2>/dev/null && :;
+
+## clear rootfs dir
+	rm -rf ${ROOTFS_BASE}/* && :;
+
+	pr_info "rootfs: debootstrap"
+	debootstrap --verbose --foreign --arch armhf ${UBUNTU_DISTRO} ${ROOTFS_BASE}/ ${PARAM_UBUNTU_LOCAL_MIRROR}
+
+## prepare qemu
+	pr_info "rootfs: debootstrap in rootfs (second-stage)"
+	cp /usr/bin/qemu-arm-static ${ROOTFS_BASE}/usr/bin/
+	cp /etc/resolv.conf ${ROOTFS_BASE}/etc
+	mount -o bind /proc ${ROOTFS_BASE}/proc
+	mount -o bind /dev ${ROOTFS_BASE}/dev
+	mount -o bind /dev/pts ${ROOTFS_BASE}/dev/pts
+	mount -o bind /sys ${ROOTFS_BASE}/sys
+	LANG=C chroot $ROOTFS_BASE /debootstrap/debootstrap --second-stage
+
+	# delete unused folder
+	LANG=C chroot $ROOTFS_BASE rm -rf  ${ROOTFS_BASE}/debootstrap
+
+	pr_info "rootfs: generate default configs"
+	mkdir -p ${ROOTFS_BASE}/etc/sudoers.d/
+	echo "user ALL=(root) /usr/bin/apt-get, /usr/bin/dpkg, /usr/bin/vi, /sbin/reboot" > ${ROOTFS_BASE}/etc/sudoers.d/user
+	chmod 0440 ${ROOTFS_BASE}/etc/sudoers.d/user
+
+## added mirror to source list
+echo "deb ${DEF_UBUNTU_MIRROR} ${UBUNTU_DISTRO} main restricted universe multiverse
+deb ${DEF_UBUNTU_MIRROR} ${UBUNTU_DISTRO}-updates main restricted universe multiverse
+deb ${DEF_UBUNTU_MIRROR} ${UBUNTU_DISTRO}-security main restricted universe multiverse
+" > etc/apt/sources.list
+
+## raise backports priority
+echo "Package: *
+Pin: release n=${UBUNTU_DISTRO}-backports
+Pin-Priority: 500
+" > etc/apt/preferences.d/backports
+
+echo "
+# /dev/mmcblk0p1  /boot           vfat    defaults        0       0
+" > etc/fstab
+
+echo "var-som-mx6" > etc/hostname
+
+echo "auto lo
+iface lo inet loopback
+" > etc/network/interfaces
+
+echo "
+locales locales/locales_to_be_generated multiselect en_US.UTF-8 UTF-8
+locales locales/default_environment_locale select en_US.UTF-8
+console-common	console-data/keymap/policy	select	Select keymap from full list
+keyboard-configuration keyboard-configuration/variant select 'English (US)'
+openssh-server openssh-server/permit-root-login select true
+" > debconf.set
+
+	pr_info "rootfs: prepare install packages in rootfs"
+## apt-get install without starting
+cat > ${ROOTFS_BASE}/usr/sbin/policy-rc.d << EOF
+#!/bin/sh
+exit 101
+EOF
+
+chmod +x ${ROOTFS_BASE}/usr/sbin/policy-rc.d
+
+## third packages stage
+cat > third-stage << EOF
+#!/bin/bash
+# apply debconfig options
+debconf-set-selections /debconf.set
+rm -f /debconf.set
+
+function protected_install() {
+    local _name=\${1}
+    local repeated_cnt=5;
+    local RET_CODE=1;
+
+    for (( c=0; c<\${repeated_cnt}; c++ ))
+    do
+        apt-get install -y \${_name} && {
+            RET_CODE=0;
+            break;
+        };
+
+        echo ""
+        echo "###########################"
+        echo "## Fix missing packeges ###"
+        echo "###########################"
+        echo ""
+
+        sleep 2;
+    done
+
+    return \${RET_CODE}
+}
+
+apt-key adv --recv-keys --keyserver keyserver.ubuntu.com 40976EAF437D05B5
+apt-key adv --recv-keys --keyserver keyserver.ubuntu.com 3B4FE6ACC0B21F32
+
+# update packages and install base
+apt-get update || apt-get update
+apt -y -f install
+apt-get upgrade
+
+protected_install sudo
+protected_install nano
+protected_install locales
+protected_install ntp
+protected_install openssh-server
+protected_install nfs-common
+
+# packages required when flashing emmc
+protected_install dosfstools
+
+# fix config for sshd (permit root login)
+sed -i -e 's/#PermitRootLogin.*/PermitRootLogin\tyes/g' /etc/ssh/sshd_config
+
+# enable graphical desktop
+protected_install xorg
+protected_install xfce4
+protected_install xfce4-goodies
+
+# sound mixer & volume
+# xfce-mixer is not part of Stretch since the stable versionit depends on
+# gstreamer-0.10, no longer used
+# Stretch now uses PulseAudio and xfce4-pulseaudio-plugin is included in
+# Xfce desktop and can be added to Xfce panels.
+#protected_install xfce4-mixer
+#protected_install xfce4-volumed
+
+# network manager
+protected_install network-manager-gnome
+
+# net-tools (ifconfig, etc.)
+protected_install net-tools
+
+## fix lightdm config (added autologin x_user) ##
+sed -i -e 's/\#autologin-user=/autologin-user=x_user/g' /etc/lightdm/lightdm.conf
+sed -i -e 's/\#autologin-user-timeout=0/autologin-user-timeout=0/g' /etc/lightdm/lightdm.conf
+
+# added alsa & alsa utilites
+protected_install alsa-utils
+protected_install gstreamer1.0-alsa
+
+# added i2c tools
+protected_install i2c-tools
+
+# added usb tools
+protected_install usbutils
+
+# added net tools
+protected_install iperf
+
+#media
+protected_install audacious
+# protected_install parole
+
+# mtd
+protected_install mtd-utils
+
+# bluetooth
+protected_install bluetooth
+protected_install bluez-obexd
+protected_install bluez-tools
+protected_install blueman
+protected_install gconf2
+
+# wifi support packages
+protected_install hostapd
+protected_install udhcpd
+
+# can support
+protected_install can-utils
+
+# delete unused packages ##
+apt-get -y remove xserver-xorg-video-ati
+apt-get -y remove xserver-xorg-video-radeon
+apt-get -y remove hddtemp
+
+apt-get -y autoremove
+
+# Remove foreign man pages and locales
+rm -rf /usr/share/man/??
+rm -rf /usr/share/man/??_*
+rm -rf /var/cache/man/??
+rm -rf /var/cache/man/??_*
+(cd /usr/share/locale; ls | grep -v en_[GU] | xargs rm -rf)
+
+# Remove document files
+rm -rf /usr/share/doc
+
+# create users and set password
+useradd -m -G audio -s /bin/bash user
+useradd -m -G audio -s /bin/bash x_user
+usermod -a -G audio,video,adm,sudo,dip,plugdev, tty user
+usermod -a -G video x_user
+echo "user:user" | chpasswd
+echo "root:root" | chpasswd
+passwd -d x_user
+
+# sado kill
+rm -f third-stage
+EOF
+
+	pr_info "rootfs: install selected debian packages (third-stage)"
+	chmod +x third-stage
+	LANG=C chroot ${ROOTFS_BASE} /third-stage
+
+## fourth-stage ##
+### install variscite-bluetooth init script
+	install -m 0755 ${G_VARISCITE_PATH}/variscite-bluetooth ${ROOTFS_BASE}/etc/init.d/
+	LANG=C chroot ${ROOTFS_BASE} update-rc.d variscite-bluetooth defaults
+	LANG=C chroot ${ROOTFS_BASE} update-rc.d variscite-bluetooth enable 2 3 4 5
+
+## end packages stage ##
+[ "${G_USER_PACKAGES}" != "" ] && {
+
+	pr_info "rootfs: install user defined packages (user-stage)"
+	pr_info "rootfs: G_USER_PACKAGES \"${G_USER_PACKAGES}\" "
+
+echo "#!/bin/bash
+# update packages
+apt-get update
+
+# install all user packages
+apt-get -y install ${G_USER_PACKAGES}
+
+rm -f user-stage
+" > user-stage
+
+	chmod +x user-stage
+	LANG=C chroot ${ROOTFS_BASE} /user-stage
+
+};
+
+## binaries rootfs patching ##
+	install -m 0644 ${G_VARISCITE_PATH}/issue ${ROOTFS_BASE}/etc/
+	install -m 0644 ${G_VARISCITE_PATH}/issue.net ${ROOTFS_BASE}/etc/
+	install -m 0644 ${G_VARISCITE_PATH}/hostapd.conf ${ROOTFS_BASE}/etc/
+	install -m 0755 ${G_VARISCITE_PATH}/rc.local ${ROOTFS_BASE}/etc/
+	install -m 0644 ${G_VARISCITE_PATH}/splash.bmp ${ROOTFS_BASE}/boot/
+
+	install -m 0644 ${G_VARISCITE_PATH}/wallpaper.png \
+		${ROOTFS_BASE}/usr/share/images/desktop-base/default
+
+## added alsa default configs ##
+	install -m 0644 ${G_VARISCITE_PATH}/asound.state ${ROOTFS_BASE}/var/lib/alsa/
+	install -m 0644 ${G_VARISCITE_PATH}/asound.conf ${ROOTFS_BASE}/etc/
+
+## Revert regular booting
+	rm -f ${ROOTFS_BASE}/usr/sbin/policy-rc.d
+
+## install kernel modules in rootfs
+	install_kernel_modules ${G_CROSS_COMPILER_PATH}/${G_CROSS_COMPILER_PREFIX} ${G_LINUX_KERNEL_DEF_CONFIG} ${G_LINUX_KERNEL_SRC_DIR} ${ROOTFS_BASE} || {
+		pr_error "Failed #$? in function install_kernel_modules"
+		return 2;
+	}
+
+## copy custom files
+	cp ${G_VARISCITE_PATH}/kobs-ng ${ROOTFS_BASE}/usr/bin
+	cp ${G_VARISCITE_PATH}/fw_env.config ${ROOTFS_BASE}/etc
+	cp ${PARAM_OUTPUT_DIR}/fw_printenv ${ROOTFS_BASE}/usr/bin
+	ln -sf fw_printenv ${ROOTFS_BASE}/usr/bin/fw_setenv
+	cp ${G_VARISCITE_PATH}/10-imx.rules ${ROOTFS_BASE}/etc/udev/rules.d
+
+	cp ${G_VARISCITE_PATH}/chroot_script* ${ROOTFS_BASE}
+
+## install wl18xx stuff
+	install_wl18xx_packages ${G_CROSS_COMPILER_PATH}/${G_CROSS_COMPILER_PREFIX}
+
+## copy imx sources to rootfs for native compilation
+	install_imx_packages
+
+	LANG=C LC_ALL=C chroot ${ROOTFS_BASE} /chroot_script_base.sh
+	sleep 1; sync
+
+## install xorg libs
+	LANG=C LC_ALL=C chroot ${ROOTFS_BASE} /chroot_script_patched-xorg-server.sh
+	sleep 1; sync
+
+## install iMX GPU libs
+	LANG=C LC_ALL=C chroot ${ROOTFS_BASE} /chroot_script_imx-gpu.sh
+	sleep 1; sync
+
+### install vivante init scripts
+	cp ${G_VARISCITE_PATH}/xorg.conf ${ROOTFS_BASE}/usr/share/X11/xorg.conf.d/90-vivante.conf
+	install -m 0755 ${G_VARISCITE_PATH}/vivante ${ROOTFS_BASE}/etc/init.d/
+	LANG=C chroot ${ROOTFS_BASE} update-rc.d vivante defaults
+	install -m 0755 ${G_VARISCITE_PATH}/rc.autohdmi ${ROOTFS_BASE}/etc/init.d
+	LANG=C chroot ${ROOTFS_BASE} update-rc.d rc.autohdmi defaults
+
+## install iMX VPU libs
+	LANG=C LC_ALL=C chroot ${ROOTFS_BASE} /chroot_script_gst.sh
+
+## clenup command
+echo "#!/bin/bash
+apt-get clean
+rm -f cleanup
+" > cleanup
+
+	# clean all packages
+	pr_info "rootfs: clean"
+	chmod +x cleanup
+	LANG=C chroot ${ROOTFS_BASE} /cleanup
+	umount ${ROOTFS_BASE}/{sys,proc,dev/pts,dev}
+
+## kill latest dbus-daemon instance due to qemu-arm-static
+	QEMU_PROC_ID=$(ps axf | grep dbus-daemon | grep qemu-arm-static | awk '{print $1}')
+	if [ -n "$QEMU_PROC_ID" ]
+	then
+		kill -9 $QEMU_PROC_ID
+	fi
+
+	rm ${ROOTFS_BASE}/etc/resolv.conf
+	rm ${ROOTFS_BASE}/usr/bin/qemu-arm-static
+	rm ${ROOTFS_BASE}/chroot_script*
+	rm -rf ${ROOTFS_BASE}/usr/local/src/*
+
+	return 0;
 }
 
 # function generate rootfs in input dir
@@ -721,7 +1056,7 @@ function install_wl18xx_packages() {
 
 	pr_info "Installing wl18xx bt firmware"
 	cp ${G_WILINK8_FW_BT_SRC_DIR}/initscripts/TIInit_*.bts ${WL18XX_FW_DIR}
-	
+
 	pr_info "Installing wl18xx wifi firmware"
 	cp ${G_WILINK8_FW_WIFI_SRC_DIR}/*.bin ${WL18XX_FW_DIR}
 	cp ${G_VARISCITE_PATH}/wl1271-nvs.bin ${WL18XX_FW_DIR}
@@ -1151,7 +1486,7 @@ function cmd_make_rootfs() {
 
 	## make debian rootfs
 	cd ${G_ROOTFS_DIR}
-	make_debian_rootfs ${G_ROOTFS_DIR} || {
+	make_ubuntu_rootfs ${G_ROOTFS_DIR} || {
 		pr_error "Failed #$? in function make_debian_rootfs"
 		cd -;
 		return 1;
